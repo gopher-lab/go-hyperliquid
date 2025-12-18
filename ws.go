@@ -39,8 +39,18 @@ type WebsocketClient struct {
 	done                  chan struct{}
 	closeOnce             sync.Once
 	reconnectWait         time.Duration
+	maxReconnectWait      time.Duration
 	debug                 bool
 	logger                lol.Logger
+
+	// Connection event callbacks
+	onDisconnect func(error)
+	onReconnect  func()
+	onError      func(error)
+
+	// Health monitoring
+	healthConfig  *HealthConfig
+	healthMonitor *healthMonitor
 }
 
 var upstreamHosts map[string]struct{}
@@ -94,10 +104,11 @@ func NewWebsocketClient(baseURL string, opts ...WsOpt) *WebsocketClient {
 	wsURL := parsedURL.String()
 
 	cli := &WebsocketClient{
-		url:           wsURL,
-		done:          make(chan struct{}),
-		reconnectWait: time.Second,
-		subscribers:   make(map[string]*uniqSubscriber),
+		url:              wsURL,
+		done:             make(chan struct{}),
+		reconnectWait:    time.Second,
+		maxReconnectWait: time.Minute,
+		subscribers:      make(map[string]*uniqSubscriber),
 		msgDispatcherRegistry: map[string]msgDispatcher{
 			ChannelPong:           NewPongDispatcher(),
 			ChannelTrades:         NewMsgDispatcher[Trades](ChannelTrades),
@@ -147,6 +158,14 @@ func (w *WebsocketClient) Connect(ctx context.Context) error {
 
 	go w.readPump(ctx)
 	go w.pingPump(ctx)
+
+	// Start health monitoring if configured
+	if w.healthConfig != nil && w.healthMonitor == nil {
+		w.healthMonitor = newHealthMonitor(*w.healthConfig, w.getSubscriptionHealth, func() {
+			w.reconnect(ctx)
+		})
+		w.healthMonitor.start()
+	}
 
 	return w.resubscribeAll()
 }
@@ -214,6 +233,11 @@ func (w *WebsocketClient) Close() error {
 func (w *WebsocketClient) close() error {
 	close(w.done)
 
+	// Stop health monitor
+	if w.healthMonitor != nil {
+		w.healthMonitor.stop()
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -227,9 +251,28 @@ func (w *WebsocketClient) close() error {
 	return nil
 }
 
+// getSubscriptionHealth returns health information for all active subscriptions.
+func (w *WebsocketClient) getSubscriptionHealth() []SubscriptionHealth {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	health := make([]SubscriptionHealth, 0, len(w.subscribers))
+	for _, sub := range w.subscribers {
+		health = append(health, sub.Health())
+	}
+	return health
+}
+
+// SubscriptionHealth returns health information for all active subscriptions.
+// This is the public API for checking subscription health.
+func (w *WebsocketClient) SubscriptionHealth() []SubscriptionHealth {
+	return w.getSubscriptionHealth()
+}
+
 // Private methods
 
 func (w *WebsocketClient) readPump(ctx context.Context) {
+	var disconnectErr error
 	defer func() {
 		w.mu.Lock()
 		if w.conn != nil {
@@ -237,6 +280,11 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 			w.conn = nil
 		}
 		w.mu.Unlock()
+
+		// Call disconnect callback
+		if w.onDisconnect != nil {
+			go w.onDisconnect(disconnectErr)
+		}
 	}()
 
 	for {
@@ -250,6 +298,7 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 			if err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 					w.logErrf("websocket read error: %v", err)
+					disconnectErr = err
 				}
 				return
 			}
@@ -261,11 +310,17 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 			var wsMsg wsMessage
 			if err := json.Unmarshal(msg, &wsMsg); err != nil {
 				w.logErrf("websocket message parse error: %v", err)
+				if w.onError != nil {
+					go w.onError(err)
+				}
 				continue
 			}
 
 			if err := w.dispatch(wsMsg); err != nil {
 				w.logErrf("failed to dispatch websocket message: %v", err)
+				if w.onError != nil {
+					go w.onError(err)
+				}
 			}
 		}
 	}
@@ -305,6 +360,7 @@ func (w *WebsocketClient) dispatch(msg wsMessage) error {
 }
 
 func (w *WebsocketClient) reconnect(ctx context.Context) {
+	initialWait := w.reconnectWait
 	for {
 		select {
 		case <-w.done:
@@ -313,12 +369,26 @@ func (w *WebsocketClient) reconnect(ctx context.Context) {
 			return
 		default:
 			if err := w.Connect(ctx); err == nil {
+				// Reset backoff on successful connection
+				w.reconnectWait = initialWait
+
+				// Reset health tracking for all subscribers
+				w.mu.RLock()
+				for _, sub := range w.subscribers {
+					sub.ResetHealthTracking()
+				}
+				w.mu.RUnlock()
+
+				// Call reconnect callback
+				if w.onReconnect != nil {
+					go w.onReconnect()
+				}
 				return
 			}
 			time.Sleep(w.reconnectWait)
-			w.reconnectWait *= 2 // TODO: configurable strategies such as exponential backoff and the like
-			if w.reconnectWait > time.Minute {
-				w.reconnectWait = time.Minute
+			w.reconnectWait *= 2
+			if w.reconnectWait > w.maxReconnectWait {
+				w.reconnectWait = w.maxReconnectWait
 			}
 		}
 	}

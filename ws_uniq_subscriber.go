@@ -2,6 +2,8 @@ package hyperliquid
 
 import (
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type callback func(any)
@@ -16,6 +18,10 @@ type uniqSubscriber struct {
 	subscriberFunc      func(subscriptable)
 	unsubscriberFunc    func(subscriptable)
 	subscriptionPayload subscriptable
+
+	// Health tracking
+	lastMessageTime atomic.Int64 // Unix nano timestamp
+	messageCount    atomic.Int64
 }
 
 func newUniqSubscriber(
@@ -23,7 +29,7 @@ func newUniqSubscriber(
 	payload subscriptable,
 	subscriberFunc, unsubscriberFunc func(subscriptable),
 ) *uniqSubscriber {
-	return &uniqSubscriber{
+	s := &uniqSubscriber{
 		id:                  id,
 		subscriptionPayload: payload,
 		count:               0,
@@ -31,6 +37,9 @@ func newUniqSubscriber(
 		subscriberFunc:      subscriberFunc,
 		unsubscriberFunc:    unsubscriberFunc,
 	}
+	// Initialize with current time so new subscriptions don't immediately appear stale
+	s.lastMessageTime.Store(time.Now().UnixNano())
+	return s
 }
 
 func (u *uniqSubscriber) subscribe(id string, cb callback) {
@@ -66,6 +75,10 @@ func (u *uniqSubscriber) unsubscribe(id string) {
 }
 
 func (u *uniqSubscriber) dispatch(data any) {
+	// Update health tracking
+	u.lastMessageTime.Store(time.Now().UnixNano())
+	u.messageCount.Add(1)
+
 	u.mu.RLock()
 	defer u.mu.RUnlock()
 
@@ -83,4 +96,19 @@ func (u *uniqSubscriber) clear() {
 	}
 	u.count = 0
 	u.unsubscriberFunc(u.subscriptionPayload)
+}
+
+// Health returns the current health state of this subscription.
+func (u *uniqSubscriber) Health() SubscriptionHealth {
+	return SubscriptionHealth{
+		Key:             u.id,
+		LastMessageTime: time.Unix(0, u.lastMessageTime.Load()),
+		MessageCount:    u.messageCount.Load(),
+	}
+}
+
+// ResetHealthTracking resets the last message time to now.
+// Called after reconnection to prevent false stale detection.
+func (u *uniqSubscriber) ResetHealthTracking() {
+	u.lastMessageTime.Store(time.Now().UnixNano())
 }
